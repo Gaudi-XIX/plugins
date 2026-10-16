@@ -115,11 +115,13 @@ catalog 更新后如果出了新 id，`OBSERVED` 里没有的按 `reasoning: tru
 ## 安装
 
 ```sh
-magpie plugin add F:\AgentData\fleet\magpie-plugin-raccoon
+magpie plugin add @magpie-community/opencode-raccoon-auth
 magpie plugin login raccoon
 ```
 
 登录时不填任何东西：`magpie plugin login raccoon` 直接确认，它读本机客户端已登录的账号。
+登录后还要去 **Settings → Usage → Plugins** 把 raccoon 的 **Daily check-in 打开**（默认关），
+日赠领取才会自动跑。
 
 改过代码后，终端里跑任何 `magpie` 命令都会按磁盘现状重读文件夹插件；GUI 侧要先
 `magpie plugin off raccoon` 再 `on` 才重载。
