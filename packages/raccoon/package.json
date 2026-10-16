@@ -1,0 +1,31 @@
+{
+  "name": "@magpie-community/opencode-raccoon-auth",
+  "version": "0.1.0",
+  "description": "商汤小浣熊 (raccoon): magpie talks to the desktop client's OpenAI-compatible gateway, one signed-in account per request.",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "provider.mjs",
+    "models.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "raccoon",
+    "xiaohuanxiong",
+    "sensenova",
+    "desktop-auth"
+  ],  "magpie": {
+    "icon": "sensenova-color",
+    "maxConcurrency": 2
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/magpie-community/plugins",
+    "directory": "packages/raccoon"
+  }
+}

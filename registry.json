@@ -33,6 +33,8 @@
       "summary": { "en": "Trae CN (trae.cn) and Trae international (trae.ai) models with your own account, free tier included — Trae's own browser sign-in. Experimental.", "zh": "用 Trae CN（trae.cn）与 Trae 国际版（trae.ai）账号使用各自的模型，含免费版，使用 Trae 自己的浏览器登录。实验性。" } },
     { "package": "@magpie-community/opencode-opendesign-auth", "name": "Open Design", "providers": ["opendesign"], "community": true,
       "summary": { "en": "Open Design Cloud's Design Plan (open-design.ai): the account's device sign-in, the models the plan entitles it to, and the plan's 5-hour and 7-day allowance and wallet balance.", "zh": "Open Design Cloud 的 Design Plan（open-design.ai）：账号设备登录、套餐可用的模型，以及 5 小时与 7 天额度、钱包余额。" } },
+    { "package": "@magpie-community/opencode-raccoon-auth", "name": "Raccoon", "icon": "sensenova-color", "providers": ["raccoon"], "community": true,
+      "summary": { "en": "SenseTime Raccoon (小浣熊): the desktop client's own OpenAI-compatible gateway, its daily login points claimed as a check-in, and every account the client is signed in to.", "zh": "商汤小浣熊：直接用桌面客户端自带的 OpenAI 兼容网关，每日登录积分做成签到，客户端登录过的账号都会用上。" } },
     { "package": "@magpie-community/middleware-param-override", "name": "Param Override", "kind": "middleware", "community": true,
       "summary": { "en": "New API's parameter override: set, delete, move or rewrite fields of every request, by model or by condition.", "zh": "New API 的参数覆盖：按模型或条件设置、删除、移动或改写每个请求的字段。" } },
     { "package": "@magpie-community/middleware-model-map", "name": "Model Map", "kind": "middleware", "community": true,
