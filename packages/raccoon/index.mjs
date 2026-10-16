@@ -7,7 +7,7 @@
 // completions at /api/web/llm/v2/chat/completions.
 
 import { randomUUID } from "node:crypto"
-import { readFileSync, statSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -115,29 +115,121 @@ function desktopAuthPath() {
   return join(homedir(), ".box-agent", "config", "auth.json")
 }
 
-function readDesktopAuth() {
+function desktopLeveldbDir() {
+  for (const envKey of ["RACCOON_LEVELDB_DIR", "OFFICE_RACCOON_LEVELDB_DIR"]) {
+    const v = String(process.env[envKey] ?? "").trim()
+    if (v) return v
+  }
+  if (process.platform !== "win32") return ""
+  const appData = process.env.APPDATA || join(homedir(), "AppData", "Roaming")
+  return join(appData, "office-raccoon", "Local Storage", "leveldb")
+}
+
+function readDesktopLeveldbAuths() {
+  const dir = desktopLeveldbDir()
+  if (!dir) return []
+  try {
+    const st = statSync(dir)
+    if (!st.isDirectory()) return []
+    const files = readdirSync(dir).filter((f) => f.endsWith(".log") || f.endsWith(".ldb"))
+    const results = []
+    const seenUids = new Set()
+    const jwtRegex = /eyJhbGciOi[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g
+
+    for (const file of files) {
+      try {
+        const filePath = join(dir, file)
+        const fileSt = statSync(filePath)
+        if (!fileSt.isFile() || fileSt.size <= 0 || fileSt.size > 10 * 1024 * 1024) continue
+        const content = readFileSync(filePath, "utf8")
+        let match
+        while ((match = jwtRegex.exec(content)) !== null) {
+          const access = match[0]
+          const claims = decodeJwtClaims(access)
+          if (!claims) continue
+          const expires = jwtExpiryMs(access)
+          if (expires > 0 && Date.now() >= expires - EARLY_MS) continue
+
+          const uid = extractUserId(claims)
+          if (!uid || seenUids.has(String(uid))) continue
+          seenUids.add(String(uid))
+
+          const name = extractDisplayName(claims)
+          results.push({
+            access,
+            refresh: "",
+            expires,
+            uid,
+            name: name || (uid ? `Raccoon-${uid}` : PROVIDER_NAME),
+            source: "desktop",
+          })
+        }
+      } catch {
+        // Individual file locked (EBUSY) or read error - skip safely
+      }
+    }
+    return results
+  } catch {
+    return []
+  }
+}
+
+function readDesktopAuth(targetUid = "", targetName = "") {
   const p = desktopAuthPath()
+  let fileAuth = null
   try {
     const st = statSync(p)
-    if (!st.isFile() || st.size <= 0 || st.size > 256 * 1024) return null
-    const raw = JSON.parse(readFileSync(p, "utf8"))
-    const access = stripBearer(raw?.access_token)
-    if (!access) return null
-    const claims = decodeJwtClaims(access)
-    const uid = extractUserId(claims)
-    const name = extractDisplayName(claims)
-    const expires = jwtExpiryMs(access)
-    return {
-      access,
-      refresh: "",
-      expires,
-      uid,
-      name: name || (uid ? `Raccoon-${uid}` : PROVIDER_NAME),
-      source: "desktop",
+    if (!st.isFile() || st.size <= 0 || st.size > 256 * 1024) fileAuth = null
+    else {
+      const raw = JSON.parse(readFileSync(p, "utf8"))
+      const access = stripBearer(raw?.access_token)
+      if (access) {
+        const claims = decodeJwtClaims(access)
+        const uid = extractUserId(claims)
+        const name = extractDisplayName(claims)
+        const expires = jwtExpiryMs(access)
+        fileAuth = {
+          access,
+          refresh: "",
+          expires,
+          uid,
+          name: name || (uid ? `Raccoon-${uid}` : PROVIDER_NAME),
+          source: "desktop",
+        }
+      }
     }
   } catch {
-    return null
+    fileAuth = null
   }
+
+  const matchesTarget = (a) => {
+    if (!a) return false
+    if (targetUid && a.uid && String(a.uid) === String(targetUid)) return true
+    if (!targetUid && targetName && a.name && String(a.name) === String(targetName)) return true
+    return false
+  }
+
+  // 1. If looking for a specific account, and auth.json matches it: use auth.json
+  if (fileAuth && (targetUid || targetName)) {
+    if (matchesTarget(fileAuth)) return fileAuth
+  }
+
+  // 2. If looking for a specific account, and auth.json doesn't match (switched account):
+  //    check LevelDB for still-valid unexpired credentials of that account
+  if (targetUid || targetName) {
+    const leveldbAuths = readDesktopLeveldbAuths()
+    const found = leveldbAuths.find(matchesTarget)
+    if (found) return found
+  }
+
+  // 3. If no target specified (e.g. initial desktop sign-in), prefer auth.json, otherwise first valid LevelDB
+  if (!targetUid && !targetName) {
+    if (fileAuth) return fileAuth
+    const leveldbAuths = readDesktopLeveldbAuths()
+    if (leveldbAuths.length > 0) return leveldbAuths[0]
+  }
+
+  return fileAuth
 }
 
 // ---- Token refresh (single-flight) ------------------------------------------
@@ -211,7 +303,7 @@ function isStale(a, marginMs = EARLY_MS) {
 // and never spend the desktop app's refresh token.
 async function currentAuth(client, auth, force = false) {
   if (auth?.source === "desktop") {
-    const d = readDesktopAuth()
+    const d = readDesktopAuth(auth.uid, auth.accountId)
     if (!d) {
       const err = new Error("商汤小浣熊桌面端未登录，请打开商汤小浣熊客户端登录")
       err.signIn = "expired"
@@ -960,7 +1052,7 @@ export const RaccoonAuthPlugin = async ({ client }) => {
         },
         {
           type: "oauth",
-          label: "商汤小浣熊桌面端登录态 (~/.box-agent/config/auth.json)",
+          label: "商汤小浣熊桌面端登录态 (~/.box-agent/config/auth.json 与 LevelDB)",
           authorize: async () => desktopSignIn(),
         },
       ],
@@ -985,4 +1077,7 @@ export const _internal = {
   desktopOnboardingSettled,
   renewed,
   renewing,
+  readDesktopAuth,
+  readDesktopLeveldbAuths,
+  desktopLeveldbDir,
 }

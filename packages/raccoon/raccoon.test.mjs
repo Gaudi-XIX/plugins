@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { RaccoonAuthPlugin, _internal } from "./index.mjs"
@@ -22,6 +22,7 @@ afterEach(() => {
   }
   delete process.env.RACCOON_MAIN_SITE_URL
   delete process.env.RACCOON_BOX_AGENT_CONFIG_DIR
+  delete process.env.RACCOON_LEVELDB_DIR
   _internal.renewed.clear()
   _internal.renewing.clear()
 })
@@ -429,6 +430,59 @@ test("desktop sign-in marks expired when desktop app switches to another account
   }))
   expect(u.signIn).toBe("expired")
   expect(u.error).toContain("切换为其他账号")
+})
+
+test("desktop sign-in resolves switched account from LevelDB when unexpired", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const authFile = join(tempDir, "auth.json")
+  // auth.json has switched to OtherUser
+  const otherUserTok = fakeJwt({ iss: "888888", name: "OtherUser", exp: Math.floor(Date.now() / 1000) + 3600 })
+  writeFileSync(authFile, JSON.stringify({ access_token: otherUserTok, refresh_token: "D1" }))
+
+  // LevelDB contains unexpired token for Mason (iss: 74350b -> uid: 7615755)
+  const leveldbDir = join(tempDir, "leveldb")
+  mkdirSync(leveldbDir, { recursive: true })
+  process.env.RACCOON_LEVELDB_DIR = leveldbDir
+  const masonTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  writeFileSync(join(leveldbDir, "000003.log"), `prefix-bytes ${masonTok} suffix-bytes`)
+
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 1200 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: { plan: "free", expired_at: "" } }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({
+    type: "oauth",
+    source: "desktop",
+    uid: "7615755",
+    accountId: "RaccoonMason",
+  }))
+  expect(u.signIn).toBe("kept")
+  expect(u.user).toBe("Mason")
+  expect(u.balance).toBe("1200 credits")
+
+  const list = _internal.readDesktopLeveldbAuths()
+  expect(list.some((a) => a.uid === "7615755" && a.access === masonTok)).toBe(true)
+})
+
+test("desktop LevelDB scanning skips expired tokens and handles corrupt files gracefully", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  const leveldbDir = join(tempDir, "leveldb")
+  mkdirSync(leveldbDir, { recursive: true })
+  process.env.RACCOON_LEVELDB_DIR = leveldbDir
+
+  const expiredTok = fakeJwt({ iss: "111111", name: "Expired", exp: Math.floor(Date.now() / 1000) - 100 })
+  const validTok = fakeJwt({ iss: "222222", name: "Valid", exp: Math.floor(Date.now() / 1000) + 3600 })
+  writeFileSync(join(leveldbDir, "000001.log"), `bad.eyJhbGciOi.bad ${expiredTok}`)
+  writeFileSync(join(leveldbDir, "000002.ldb"), `foo ${validTok} bar`)
+
+  const list = _internal.readDesktopLeveldbAuths()
+  expect(list).toHaveLength(1)
+  expect(list[0].uid).toBe(BigInt("0x222222").toString(10))
+  expect(list[0].access).toBe(validTok)
 })
 
 test("renewToken cache hit inside 60s invokes save with merged tokens", async () => {
