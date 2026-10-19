@@ -485,6 +485,43 @@ test("desktop LevelDB scanning skips expired tokens and handles corrupt files gr
   expect(list[0].access).toBe(validTok)
 })
 
+test("desktop LevelDB scanning ignores non-Raccoon third-party JWTs with sub claims", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  const leveldbDir = join(tempDir, "leveldb")
+  mkdirSync(leveldbDir, { recursive: true })
+  process.env.RACCOON_LEVELDB_DIR = leveldbDir
+
+  const thirdPartyTok = fakeJwt({ sub: "external-account-12345", iss: "https://auth.example.com", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const validTok = fakeJwt({ iss: "333333", name: "RaccoonUser", exp: Math.floor(Date.now() / 1000) + 3600 })
+
+  writeFileSync(join(leveldbDir, "000001.log"), `data ${thirdPartyTok} ${validTok}`)
+
+  const list = _internal.readDesktopLeveldbAuths()
+  expect(list).toHaveLength(1)
+  expect(list[0].uid).toBe(BigInt("0x333333").toString(10))
+  expect(list[0].access).toBe(validTok)
+})
+
+test("desktop LevelDB scanning selects latest token by exp for same account across files", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  const leveldbDir = join(tempDir, "leveldb")
+  mkdirSync(leveldbDir, { recursive: true })
+  process.env.RACCOON_LEVELDB_DIR = leveldbDir
+
+  const nowSec = Math.floor(Date.now() / 1000)
+  const earlierTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 1000 })
+  const latestTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 5000 })
+
+  writeFileSync(join(leveldbDir, "000001.ldb"), `prefix ${earlierTok} suffix`)
+  writeFileSync(join(leveldbDir, "000002.ldb"), `prefix ${latestTok} suffix`)
+
+  const list = _internal.readDesktopLeveldbAuths()
+  expect(list).toHaveLength(1)
+  expect(list[0].uid).toBe("7615755")
+  expect(list[0].access).toBe(latestTok)
+  expect(list[0].expires).toBe((nowSec + 5000) * 1000)
+})
+
 test("renewToken cache hit inside 60s invokes save with merged tokens", async () => {
   const staleTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) - 5 })
   const freshTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })

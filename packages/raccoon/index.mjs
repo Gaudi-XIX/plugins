@@ -84,9 +84,15 @@ function extractUserId(claims) {
     const dec = hexIdToDecimal(claims[k])
     if (dec) return dec
   }
-  for (const k of ["sub", "id", "user_id"]) {
-    const s = String(claims[k] ?? "").trim()
-    if (s) return s
+  const isRaccoonIam =
+    claims.iss === "xiaohuanxiong.com/iam" ||
+    (Array.isArray(claims.aud) && claims.aud.includes("xiaohuanxiong.com")) ||
+    claims.aud === "xiaohuanxiong.com"
+  if (isRaccoonIam) {
+    for (const k of ["sub", "id", "user_id"]) {
+      const s = String(claims[k] ?? "").trim()
+      if (s) return s
+    }
   }
   return ""
 }
@@ -132,8 +138,7 @@ function readDesktopLeveldbAuths() {
     const st = statSync(dir)
     if (!st.isDirectory()) return []
     const files = readdirSync(dir).filter((f) => f.endsWith(".log") || f.endsWith(".ldb"))
-    const results = []
-    const seenUids = new Set()
+    const bestByUid = new Map()
     const jwtRegex = /eyJhbGciOi[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g
 
     for (const file of files) {
@@ -151,24 +156,28 @@ function readDesktopLeveldbAuths() {
           if (expires > 0 && Date.now() >= expires - EARLY_MS) continue
 
           const uid = extractUserId(claims)
-          if (!uid || seenUids.has(String(uid))) continue
-          seenUids.add(String(uid))
+          if (!uid) continue
 
-          const name = extractDisplayName(claims)
-          results.push({
-            access,
-            refresh: "",
-            expires,
-            uid,
-            name: name || (uid ? `Raccoon-${uid}` : PROVIDER_NAME),
-            source: "desktop",
-          })
+          const exp = Number(claims?.exp) || 0
+          const existing = bestByUid.get(uid)
+          if (!existing || exp > existing._exp) {
+            const name = extractDisplayName(claims)
+            bestByUid.set(uid, {
+              access,
+              refresh: "",
+              expires,
+              uid,
+              name: name || (uid ? `Raccoon-${uid}` : PROVIDER_NAME),
+              source: "desktop",
+              _exp: exp,
+            })
+          }
         }
       } catch {
         // Individual file locked (EBUSY) or read error - skip safely
       }
     }
-    return results
+    return Array.from(bestByUid.values()).map(({ _exp, ...auth }) => auth)
   } catch {
     return []
   }
