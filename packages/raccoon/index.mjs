@@ -188,10 +188,19 @@ function readDesktopLeveldbAuths() {
 // The desktop app is signed in to one account at a time. Signing in to the
 // second account overwrites the first one's credential in auth.json and, once
 // its leveldb log is rotated off disk, takes it off disk entirely — a second
-// seat would then be answered "switched to another account". So every desktop
-// credential read is mirrored here until its own JWT expires; nothing else is
-// written, and the mirror is never authoritative: it only answers for an
-// account the app no longer has on disk.
+// seat would then be answered "switched to another account". That is worse than
+// losing the file: signing in revokes the previous account's session on the
+// server, so a JWT with a month of exp left answers
+// 401 {"code":200003,"authorization_verify_error"} on both the meter and the
+// check-in call, and no refresh endpoint revives it (all of them 404). Two
+// desktop accounts therefore cannot be live at once; there is one live account
+// and, at best, the other account's credential kept for the day it is signed in
+// again.
+//
+// So every desktop credential read is mirrored here until its own JWT expires;
+// nothing else is written, and the mirror is never authoritative: it only
+// answers for an account the app no longer has on disk, so that seat answers for
+// its own account instead of borrowing the live account's credential.
 //
 // The mirror is read-only in spirit but must be written, so it lives in the
 // plugin's own directory (not in ~/.box-agent, which stays untouched) and a
@@ -294,6 +303,9 @@ function keepDesktopAuths(read, held, pruned) {
 // seat is named after first — wherever it is still readable (auth.json, then
 // the leveldb logs, then the mirror) — so a second seat keeps its own
 // credential instead of both taking whichever account the app currently holds.
+// It is still one live account: a named seat whose account was revoked answers
+// 401 expired and stays that way until that account is signed in again (see the
+// mirror note above), so a second seat is never a second credit pool.
 function desktopAuthFor(auth = {}) {
   const current = readDesktopAuth(auth.uid, auth.accountId)
   const seen = current ? [current] : []
