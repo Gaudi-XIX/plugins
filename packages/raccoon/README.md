@@ -12,6 +12,7 @@ OpenCode & Magpie provider plugin for **SenseTime Raccoon (商汤小浣熊, `xia
 - **Usage & allowances**: reports available credits, unexpired grant bills, daily expiration timestamps, and Pro/Free subscription plans.
 - **Daily check-in & desktop onboarding grant**: supports Magpie automatic daily check-in (`+300` credits/day) and one-time desktop onboarding grant (`+3000` credits).
 - **SSE model rewrite**: transparently rewrites internal upstream model names back to requested downstream models for client compatibility.
+- **Kept desktop credentials (mirror)**: the desktop app holds one account at a time, so the previous account's JWT disappears from `auth.json` and, once its LevelDB log rotates, from disk. Every desktop credential read is mirrored to `~/.config/magpie/raccoon-accounts.json` (override with `RACCOON_ACCOUNTS_FILE`) until its own JWT expires. The mirror is never authoritative: the account the app holds now always wins, and each seat keeps the account it is named after.
 
 ## 中文
 
@@ -27,3 +28,4 @@ OpenCode & Magpie provider plugin for **SenseTime Raccoon (商汤小浣熊, `xia
 - **积分余额与套餐查询**：展示可用积分、未过期发放额度、每日积分过期时间与 Pro/Free 套餐状态。
 - **每日签到与桌面端登录奖励**：支持 Magpie 每日自动签到（`+300` 积分/天）及首次桌面端 `+3000` 积分登录奖励领取。
 - **SSE 模型名重写**：将上游响应中的内部模型名重写为下游请求的 `model`，确保 Claude Code / Codex / OpenCode 等客户端兼容。
+- **桌面端登录态镜像**：客户端同时只登录一个账号，切号后上一个账号的 JWT 会从 `auth.json` 消失，LevelDB 日志轮转后连盘上也不剩。凡读取到的桌面端凭据都会镜像到 `~/.config/magpie/raccoon-accounts.json`（可用 `RACCOON_ACCOUNTS_FILE` 覆盖），直到该 JWT 自身过期。镜像不具权威：客户端当前账号永远优先，各席位固定使用自己名下的账号。

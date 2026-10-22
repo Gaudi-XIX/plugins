@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { RaccoonAuthPlugin, _internal } from "./index.mjs"
@@ -23,6 +23,7 @@ afterEach(() => {
   delete process.env.RACCOON_MAIN_SITE_URL
   delete process.env.RACCOON_BOX_AGENT_CONFIG_DIR
   delete process.env.RACCOON_LEVELDB_DIR
+  delete process.env.RACCOON_ACCOUNTS_FILE
   _internal.renewed.clear()
   _internal.renewing.clear()
 })
@@ -151,6 +152,11 @@ test("refresh 400 params_invalid_error marks signIn expired and uses details", a
 test("desktop sign-in is read-only and never writes or refreshes auth.json", async () => {
   tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
   process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  process.env.RACCOON_LEVELDB_DIR = join(tempDir, "leveldb")
+  // The mirror is per-plugin, not the app's: keep it inside the temp dir so a
+  // credential kept by an earlier test — or by the running plugin — is not
+  // mistaken for a sign-in here.
+  process.env.RACCOON_ACCOUNTS_FILE = join(tempDir, "kept.json")
   const authFile = join(tempDir, "auth.json")
   const staleTok = fakeJwt({ iss: "74350b", name: "DeskUser", exp: Math.floor(Date.now() / 1000) - 10 })
   const originalContent = JSON.stringify({ access_token: staleTok, refresh_token: "D1" }, null, 2)
@@ -417,6 +423,7 @@ test("loader refreshes on 401, strips x-api-key, rewrites split SSE stream, and 
 test("desktop sign-in marks expired when desktop app switches to another account", async () => {
   tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
   process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  process.env.RACCOON_ACCOUNTS_FILE = join(tempDir, "kept.json")
   const authFile = join(tempDir, "auth.json")
   const otherUserTok = fakeJwt({ iss: "888888", name: "OtherUser", exp: Math.floor(Date.now() / 1000) + 3600 })
   writeFileSync(authFile, JSON.stringify({ access_token: otherUserTok, refresh_token: "D1" }))
@@ -435,6 +442,7 @@ test("desktop sign-in marks expired when desktop app switches to another account
 test("desktop sign-in resolves switched account from LevelDB when unexpired", async () => {
   tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
   process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  process.env.RACCOON_ACCOUNTS_FILE = join(tempDir, "kept.json")
   const authFile = join(tempDir, "auth.json")
   // auth.json has switched to OtherUser
   const otherUserTok = fakeJwt({ iss: "888888", name: "OtherUser", exp: Math.floor(Date.now() / 1000) + 3600 })
@@ -520,6 +528,148 @@ test("desktop LevelDB scanning selects latest token by exp for same account acro
   expect(list[0].uid).toBe("7615755")
   expect(list[0].access).toBe(latestTok)
   expect(list[0].expires).toBe((nowSec + 5000) * 1000)
+})
+
+// ---- Kept desktop credentials (the mirror) -----------------------------------
+//
+// The desktop app holds one account at a time. Signing in to the second
+// account removes the first one's credential from auth.json and, after its
+// leveldb log rotates off disk, from disk entirely. A second seat would then
+// be answered "switched to another account", so what was read is kept here
+// until its own JWT runs out.
+
+const ACCOUNTS_ENV = "RACCOON_ACCOUNTS_FILE"
+
+function desktopEnv(tempDir, { authTokens = [], leveldbTokens = [] } = {}) {
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const leveldbDir = join(tempDir, "leveldb")
+  mkdirSync(leveldbDir, { recursive: true })
+  process.env.RACCOON_LEVELDB_DIR = leveldbDir
+  if (authTokens.length) {
+    writeFileSync(join(tempDir, "auth.json"), JSON.stringify({ access_token: authTokens[0], refresh_token: "RT" }))
+  } else {
+    writeFileSync(join(tempDir, "auth.json"), JSON.stringify({}))
+  }
+  leveldbTokens.forEach((tok, i) => writeFileSync(join(leveldbDir, `00000${i + 3}.log`), `prefix ${tok} suffix`))
+}
+
+test("keeps the credential of an account the app has switched away from", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  const accountsFile = join(tempDir, "kept.json")
+  process.env[ACCOUNTS_ENV] = accountsFile
+  const nowSec = Math.floor(Date.now() / 1000)
+  const masonTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 3600 })
+  const otherTok = fakeJwt({ iss: "888888", name: "Other", exp: nowSec + 7200 })
+
+  // First: the app is signed in to Mason, and that credential is kept.
+  desktopEnv(tempDir, { authTokens: [masonTok] })
+  let d = _internal.desktopAuthFor({ uid: "7615755" })
+  expect(d.access).toBe(masonTok)
+  expect(JSON.parse(readFileSync(accountsFile, "utf8")).accounts).toHaveLength(1)
+
+  // Then: the app signs in to Other. Mason's credential is gone from disk but
+  // his JWT still runs, so a seat named after Mason still gets Mason.
+  desktopEnv(tempDir, { authTokens: [otherTok] })
+  d = _internal.desktopAuthFor({ uid: "7615755" })
+  expect(d.access).toBe(masonTok)
+  expect(d.name).toBe("Mason")
+
+  // A seat named after the account the app holds now gets that one.
+  const other = _internal.desktopAuthFor({ uid: BigInt("0x888888").toString(10) })
+  expect(other.access).toBe(otherTok)
+
+  // An unnamed seat gets the current one, not the kept one.
+  expect(_internal.desktopAuthFor({}).access).toBe(otherTok)
+})
+
+test("kept credentials drop out when their own JWT expires", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  const accountsFile = join(tempDir, "kept.json")
+  process.env[ACCOUNTS_ENV] = accountsFile
+  const nowSec = Math.floor(Date.now() / 1000)
+  // Mason's JWT is still valid on the first read and runs out before the
+  // second one, which is far enough ahead to be past the 60s early window.
+  const masonTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 90 })
+  const otherTok = fakeJwt({ iss: "888888", name: "Other", exp: nowSec + 7200 })
+
+  desktopEnv(tempDir, { authTokens: [masonTok] })
+  expect(_internal.desktopAuthFor({ uid: "7615755" }).access).toBe(masonTok)
+
+  // The app switches away; Mason's JWT then runs out. Nothing about Mason is
+  // readable any more, so the seat must not get his dead token, and the mirror
+  // must stop listing him.
+  const realNow = Date.now
+  Date.now = () => realNow() + 30_000
+  try {
+    desktopEnv(tempDir, { authTokens: [otherTok] })
+    const after = _internal.desktopAuthFor({ uid: "7615755" })
+    expect(after.access).not.toBe(masonTok)
+    const kept = JSON.parse(readFileSync(accountsFile, "utf8")).accounts
+    expect(kept.some((a) => a.access === masonTok)).toBe(false)
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test("a re-login in the app replaces the kept credential", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  const accountsFile = join(tempDir, "kept.json")
+  process.env[ACCOUNTS_ENV] = accountsFile
+  const nowSec = Math.floor(Date.now() / 1000)
+  const oldTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 3600 })
+  const newTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 7200 })
+
+  desktopEnv(tempDir, { authTokens: [oldTok] })
+  expect(_internal.desktopAuthFor({ uid: "7615755" }).access).toBe(oldTok)
+
+  desktopEnv(tempDir, { authTokens: [newTok] })
+  const d = _internal.desktopAuthFor({ uid: "7615755" })
+  expect(d.access).toBe(newTok)
+  const kept = JSON.parse(readFileSync(accountsFile, "utf8")).accounts
+  expect(kept).toHaveLength(1)
+  expect(kept[0].access).toBe(newTok)
+})
+
+test("an unwritable mirror leaves the request working", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  // A directory where the file is expected: every write fails.
+  process.env[ACCOUNTS_ENV] = join(tempDir, "kept-dir")
+  mkdirSync(process.env[ACCOUNTS_ENV])
+  const nowSec = Math.floor(Date.now() / 1000)
+  const masonTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 3600 })
+
+  desktopEnv(tempDir, { authTokens: [masonTok] })
+  const d = _internal.desktopAuthFor({ uid: "7615755" })
+  expect(d.access).toBe(masonTok)
+})
+
+test("a seat keeps its own account when the app switched away, through usage", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env[ACCOUNTS_ENV] = join(tempDir, "kept.json")
+  const nowSec = Math.floor(Date.now() / 1000)
+  const masonTok = fakeJwt({ iss: "74350b", name: "Mason", exp: nowSec + 3600 })
+  const otherTok = fakeJwt({ iss: "888888", name: "Other", exp: nowSec + 7200 })
+
+  desktopEnv(tempDir, { authTokens: [masonTok] })
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 1200 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: { plan: "free", expired_at: "" } }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+
+  // Mason's credential is read and kept while he is signed in.
+  let hooks = await RaccoonAuthPlugin({ client: {} })
+  let u = await hooks.auth.usage(async () => ({ type: "oauth", source: "desktop", uid: "7615755", accountId: "Mason" }))
+  expect(u.signIn).toBe("kept")
+
+  // The app signs in to Other. The same seat still reads Mason's usage, not
+  // Other's, and does not report "switched to another account".
+  desktopEnv(tempDir, { authTokens: [otherTok] })
+  hooks = await RaccoonAuthPlugin({ client: {} })
+  u = await hooks.auth.usage(async () => ({ type: "oauth", source: "desktop", uid: "7615755", accountId: "Mason" }))
+  expect(u.signIn).toBe("kept")
+  expect(u.user).toBe("Mason")
+  expect(u.balance).toBe("1200 credits")
 })
 
 test("renewToken cache hit inside 60s invokes save with merged tokens", async () => {

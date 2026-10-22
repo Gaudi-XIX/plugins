@@ -7,9 +7,9 @@
 // completions at /api/web/llm/v2/chat/completions.
 
 import { randomUUID } from "node:crypto"
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 const PROVIDER_ID = "raccoon"
 const PROVIDER_NAME = "商汤小浣熊"
@@ -183,6 +183,137 @@ function readDesktopLeveldbAuths() {
   }
 }
 
+// ---- Kept desktop credentials (read-only mirror) ----------------------------
+//
+// The desktop app is signed in to one account at a time. Signing in to the
+// second account overwrites the first one's credential in auth.json and, once
+// its leveldb log is rotated off disk, takes it off disk entirely — a second
+// seat would then be answered "switched to another account". So every desktop
+// credential read is mirrored here until its own JWT expires; nothing else is
+// written, and the mirror is never authoritative: it only answers for an
+// account the app no longer has on disk.
+//
+// The mirror is read-only in spirit but must be written, so it lives in the
+// plugin's own directory (not in ~/.box-agent, which stays untouched) and a
+// write failure leaves the current request unaffected.
+
+function desktopAccountsPath() {
+  const override = String(process.env.RACCOON_ACCOUNTS_FILE ?? "").trim()
+  if (override) return override
+  const configDir =
+    String(process.env.MAGPIE_CONFIG_DIR ?? "").trim() ||
+    String(process.env.XDG_CONFIG_HOME ?? "").trim() ||
+    join(homedir(), ".config")
+  return join(configDir, "magpie", "raccoon-accounts.json")
+}
+
+// What is kept right now, minus what has run out. `pruned` says the file on
+// disk differs from this answer, so the caller knows a rewrite is owed.
+function keptDesktopAuths() {
+  let list = []
+  try {
+    const raw = JSON.parse(readFileSync(desktopAccountsPath(), "utf8"))
+    list = Array.isArray(raw?.accounts) ? raw.accounts : []
+  } catch {
+    list = []
+  }
+  const accounts = []
+  let pruned = false
+  for (const entry of list) {
+    if (!entry || typeof entry.access !== "string" || !entry.access) {
+      pruned = true
+      continue
+    }
+    const claims = decodeJwtClaims(entry.access)
+    const uid = extractUserId(claims)
+    if (!uid) {
+      pruned = true
+      continue
+    }
+    const expires = jwtExpiryMs(entry.access)
+    if (expires > 0 && Date.now() >= expires - EARLY_MS) {
+      pruned = true
+      continue
+    }
+    accounts.push({
+      access: entry.access,
+      refresh: "",
+      expires,
+      uid,
+      name: entry.name || extractDisplayName(claims) || (uid ? `Raccoon-${uid}` : PROVIDER_NAME),
+      source: "desktop",
+    })
+  }
+  return { accounts, pruned }
+}
+
+// Merge what was just read with what is kept, newest JWT per account, and
+// mirror the result. Returns every desktop account usable right now.
+//
+// Read first, kept second: the credential the app holds now answers for an
+// unnamed seat (initial sign-in, or a seat with no account of its own), so it
+// has to come first in the merged list. Kept credentials only fill in accounts
+// the app no longer has on disk.
+function keepDesktopAuths(read, held, pruned) {
+  const byUid = new Map()
+  let changed = pruned
+  const offer = (a) => {
+    const uid = String(a?.uid ?? "")
+    if (!uid || !a?.access) return
+    if (isStale(a, EARLY_MS)) return
+    const was = byUid.get(uid)
+    if (was && was.access === a.access) return
+    const expires = Number(a.expires) || jwtExpiryMs(a.access)
+    if (was && (was.expires ?? 0) >= (expires ?? 0)) return
+    byUid.set(uid, { ...a, expires })
+    changed = true
+  }
+  for (const a of read ?? []) offer(a)
+  for (const a of held ?? []) offer(a)
+  const accounts = Array.from(byUid.values())
+  if (changed) {
+    try {
+      const file = desktopAccountsPath()
+      mkdirSync(dirname(file), { recursive: true })
+      const temp = `${file}.${process.pid}.tmp`
+      writeFileSync(
+        temp,
+        `${JSON.stringify({ accounts: accounts.map(({ access, uid, name }) => ({ access, uid, name })) }, null, 2)}\n`,
+        { mode: 0o600 },
+      )
+      renameSync(temp, file)
+    } catch {
+      // A mirror that cannot be written still leaves this request right: the
+      // app's own credential is the answer, the file only carries it on.
+    }
+  }
+  return accounts
+}
+
+// The desktop credential a seat should use. Order matters: the account the
+// seat is named after first — wherever it is still readable (auth.json, then
+// the leveldb logs, then the mirror) — so a second seat keeps its own
+// credential instead of both taking whichever account the app currently holds.
+function desktopAuthFor(auth = {}) {
+  const current = readDesktopAuth(auth.uid, auth.accountId)
+  const seen = current ? [current] : []
+  for (const a of readDesktopLeveldbAuths()) {
+    if (!seen.some((s) => String(s.uid) === String(a.uid))) seen.push(a)
+  }
+  const kept = keptDesktopAuths()
+  for (const a of kept.accounts) {
+    if (!seen.some((s) => String(s.uid) === String(a.uid))) seen.push(a)
+  }
+  const accounts = keepDesktopAuths(seen, kept.accounts, kept.pruned)
+  if (!accounts.length) return null
+  if (auth.uid) {
+    const own = accounts.find((a) => String(a.uid) === String(auth.uid))
+    if (own) return own
+  }
+  // No seat of its own: the account the app holds now, else whatever was kept.
+  return accounts[0]
+}
+
 function readDesktopAuth(targetUid = "", targetName = "") {
   const p = desktopAuthPath()
   let fileAuth = null
@@ -309,10 +440,11 @@ function isStale(a, marginMs = EARLY_MS) {
 }
 
 // Desktop sign-in is strictly read-only: never write ~/.box-agent/config/auth.json
-// and never spend the desktop app's refresh token.
+// and never spend the desktop app's refresh token. The mirror it keeps of the
+// accounts it has already seen is written by the plugin, not by the app.
 async function currentAuth(client, auth, force = false) {
   if (auth?.source === "desktop") {
-    const d = readDesktopAuth(auth.uid, auth.accountId)
+    const d = desktopAuthFor(auth)
     if (!d) {
       const err = new Error("商汤小浣熊桌面端未登录，请打开商汤小浣熊客户端登录")
       err.signIn = "expired"
@@ -863,7 +995,7 @@ function desktopSignIn() {
     instructions: "直接复用本机商汤小浣熊客户端的实时登录态 (~/.box-agent/config/auth.json)。",
     method: "auto",
     async callback() {
-      const d = readDesktopAuth()
+      const d = desktopAuthFor({})
       if (!d) return { type: "failed", error: "未检测到本机商汤小浣熊登录态 (~/.box-agent/config/auth.json)" }
       if (isStale(d, EARLY_MS)) {
         return { type: "failed", error: "商汤小浣熊桌面端登录态已过期，请先打开商汤小浣熊客户端重新登录" }
@@ -1089,4 +1221,8 @@ export const _internal = {
   readDesktopAuth,
   readDesktopLeveldbAuths,
   desktopLeveldbDir,
+  desktopAccountsPath,
+  keptDesktopAuths,
+  keepDesktopAuths,
+  desktopAuthFor,
 }
